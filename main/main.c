@@ -21,8 +21,8 @@
 #include "mpu6050.h"
 
 // ================= CONFIGURAÇÃO RÁPIDA =================
-#define INVERT_X 1   // 0 = normal, 1 = inverte sinal X
-#define INVERT_Y 1   // 0 = normal, 1 = inverte sinal Y
+#define INVERT_X 0   // 0 = normal, 1 = inverte sinal X
+#define INVERT_Y 0   // 0 = normal, 1 = inverte sinal Y
 #define DEBUG_JOYSTICK 1 // 1 = imprime joy_x/joy_y na serial (útil pra calibrar) ; depois opcional desligar
 // ======================================================
 
@@ -48,9 +48,9 @@
 #define CLICK_ACCEL_THRESHOLD_Y   32000    // antes 25000
 #define CLICK_RESET_THRESHOLD_Y   2000     // antes 1000
 #define CLICK_GYRO_THRESHOLD      3500     // antes 1800
-#define IMU_CLICK_DEBOUNCE_MS     450      // um pouco mais de debounce
+#define IMU_CLICK_DEBOUNCE_MS     400      // leve aumento para reduzir disparos muito frequentes
 // número de amostras consecutivas necessárias acima do limiar para considerar clique
-#define IMU_REQUIRED_SAMPLES      4
+#define IMU_REQUIRED_SAMPLES      3
 
 
 // joystick thresholds — ajuste se necessário
@@ -161,7 +161,7 @@ void task_buttons(void *p) {
     }
 }
 
-// TASK: mpu + joystick
+// TASK: mpu + joystick (versão atualizada)
 void task_mpu_and_joy(void *p) {
     i2c_init(I2C_PORT, 400000);
     gpio_set_function(IMU_SDA, GPIO_FUNC_I2C);
@@ -182,11 +182,7 @@ void task_mpu_and_joy(void *p) {
     bool key_w = false, key_a = false, key_s = false, key_d = false;
     int16_t last_sent_joy_x = 0, last_sent_joy_y = 0;
 
-    // filtros simples (EMA) e contadores para exigir múltiplas leituras consecutivas acima do limiar
-    static float filt_acc_y = 0.0f;
-    static float filt_gyro_x = 0.0f;
-    static float filt_gyro_z = 0.0f;
-    const float ALPHA_IMU = 0.3f; // 0..1 (menor = mais suave)
+    // contadores para exigir múltiplas leituras consecutivas acima do limiar
     static int accel_over_count = 0;
     static int gyro_over_count  = 0;
 
@@ -203,50 +199,59 @@ void task_mpu_and_joy(void *p) {
         out.joy_y = 0;
         bool any = false;
 
-        // atualizar filtros (convertendo para float para manter simples)
-        filt_acc_y  += ALPHA_IMU * ((float)accel[1] - filt_acc_y);
-        filt_gyro_x += ALPHA_IMU * ((float)gyro[0]   - filt_gyro_x);
-        filt_gyro_z += ALPHA_IMU * ((float)gyro[2]   - filt_gyro_z);
+        // --- calcula ângulos (pitch/roll) a partir do acelerômetro ---
+        // escala para g (MPU6050 em ±2g -> 16384 LSB/g)
+        const float AX_SCALE = 1.0f / 16384.0f;
+        float ax = accel[0] * AX_SCALE;
+        float ay = accel[1] * AX_SCALE;
+        float az = accel[2] * AX_SCALE;
+        // pitch: rotação em torno do eixo Y (aprox), roll: em torno do eixo X
+        float pitch = atan2f(ax, sqrtf(ay*ay + az*az)) * 57.295779513f; // graus
+        float roll  = atan2f(ay, az) * 57.295779513f; // graus
 
-        // clique IMU com confirmação por múltiplas amostras usando valores filtrados
+        // --- clique IMU com confirmação por múltiplas amostras e só se inclinar > 80°
+        bool tilted_enough = (fabsf(pitch) > 80.0f) || (fabsf(roll) > 80.0f);
+
         // acumula contagens quando acima do limiar, zera quando abaixo
-        if (filt_acc_y > CLICK_ACCEL_THRESHOLD_Y) {
+        if (accel[1] > CLICK_ACCEL_THRESHOLD_Y) {
             if (accel_over_count < IMU_REQUIRED_SAMPLES) accel_over_count++;
         } else {
             accel_over_count = 0;
         }
 
-        int32_t gz = (int32_t)fabsf(filt_gyro_z);
-        int32_t gx = (int32_t)fabsf(filt_gyro_x);
+        int32_t gz = abs(gyro[2]);
+        int32_t gx = abs(gyro[0]);
         if ((gx > CLICK_GYRO_THRESHOLD || gz > CLICK_GYRO_THRESHOLD)) {
             if (gyro_over_count < IMU_REQUIRED_SAMPLES) gyro_over_count++;
         } else {
             gyro_over_count = 0;
         }
 
-        bool click_condition = (accel_over_count >= IMU_REQUIRED_SAMPLES) || (gyro_over_count >= IMU_REQUIRED_SAMPLES);
-        if (click_condition) {
+        bool click_condition_basic = (accel_over_count >= IMU_REQUIRED_SAMPLES) || (gyro_over_count >= IMU_REQUIRED_SAMPLES);
+        // requer também inclinação suficiente
+        if (click_condition_basic && tilted_enough) {
             uint64_t now = to_us_since_boot(get_absolute_time()) / 1000ULL;
             if (can_click && (now - last_click_ts) > IMU_CLICK_DEBOUNCE_MS) {
                 out.click = true; any = true; last_click_ts = now; can_click = false;
+                if (DEBUG_JOYSTICK) printf("IMU CLICK (pitch=%.1f roll=%.1f)\r\n", pitch, roll);
             }
         }
-        // libera para novo clique quando o eixo Y de aceleração cai abaixo do limiar de reset
-    if (filt_acc_y < CLICK_RESET_THRESHOLD_Y) can_click = true;
+        // libera para novo clique quando o eixo Y de aceleração cair abaixo do limiar de reset
+        if (accel[1] < CLICK_RESET_THRESHOLD_Y) can_click = true;
 
         // JOYSTICK read
-    adc_select_input(0);
-    uint16_t raw_x = adc_read();
-    adc_select_input(1);
-    uint16_t raw_y = adc_read();
+        adc_select_input(0);
+        uint16_t raw_x = adc_read();
+        adc_select_input(1);
+        uint16_t raw_y = adc_read();
 
-    // Filtro EMA simples (inteiro): new = old + (measured - old)/4
-    filt_raw_x += ((int32_t)raw_x - filt_raw_x) >> 2;
-    filt_raw_y += ((int32_t)raw_y - filt_raw_y) >> 2;
+        // Filtro EMA simples (inteiro): new = old + (measured - old)/4
+        filt_raw_x += ((int32_t)raw_x - filt_raw_x) >> 2;
+        filt_raw_y += ((int32_t)raw_y - filt_raw_y) >> 2;
 
         // mapear 0..4095 -> centered signed *16 (mesma escala que antes)
-    int32_t tmpx = (filt_raw_x - 2048) * 16;
-    int32_t tmpy = (filt_raw_y - 2048) * 16;
+        int32_t tmpx = (filt_raw_x - 2048) * 16;
+        int32_t tmpy = (filt_raw_y - 2048) * 16;
 
         // aplicar inversão se necessário
         if (INVERT_X) tmpx = -tmpx;
@@ -255,12 +260,12 @@ void task_mpu_and_joy(void *p) {
         int16_t joy_x = (int16_t)tmpx;
         int16_t joy_y = (int16_t)tmpy;
 
-        // DEBUG: print valores brutos para calibrar
+        // DEBUG: print valores brutos para calibrar e estados das teclas
         if (DEBUG_JOYSTICK) {
-            // imprime apenas quando houver mudança significativa para não spammar demais
             static int16_t last_dbg_x = 0, last_dbg_y = 0;
             if (abs(joy_x - last_dbg_x) > 200 || abs(joy_y - last_dbg_y) > 200) {
-                printf("JOY raw_x=%d raw_y=%d -> joy_x=%d joy_y=%d\r\n", raw_x, raw_y, joy_x, joy_y);
+                printf("JOY raw_x=%u raw_y=%u filt_x=%ld filt_y=%ld -> joy_x=%d joy_y=%d (adj)\r\n",
+                       raw_x, raw_y, (long)filt_raw_x, (long)filt_raw_y, joy_x, joy_y);
                 last_dbg_x = joy_x; last_dbg_y = joy_y;
             }
         }
@@ -269,27 +274,43 @@ void task_mpu_and_joy(void *p) {
         int16_t adj_x = (abs(joy_x) < JOY_DEADZONE) ? 0 : joy_x;
         int16_t adj_y = (abs(joy_y) < JOY_DEADZONE) ? 0 : joy_y;
 
-    // Y -> W (up) / S (down) com histerese
-    bool next_w = key_w;
-    if (!key_w && (adj_y > JOY_KEY_PRESS_THRESHOLD)) next_w = true;
-    if (key_w && (adj_y < JOY_KEY_RELEASE_THRESHOLD)) next_w = false;
-    if (next_w != key_w) { key_w = next_w; uart_send_packet_flag(ID_KEY_W, key_w ? 1 : 0); }
+        // W / S (eixo Y) usando macros de limiar (histerese)
+        bool next_w = key_w;
+        if (!key_w && (adj_y > JOY_KEY_PRESS_THRESHOLD)) next_w = true;
+        if (key_w && (adj_y < JOY_KEY_RELEASE_THRESHOLD)) next_w = false;
+        if (next_w != key_w) {
+            key_w = next_w;
+            uart_send_packet_flag(ID_KEY_W, key_w ? 1 : 0);
+            if (DEBUG_JOYSTICK) printf("KEY W -> %d (adj_y=%d)\r\n", key_w, adj_y);
+        }
 
-    bool next_s = key_s;
-    if (!key_s && (adj_y < -JOY_KEY_PRESS_THRESHOLD)) next_s = true;
-    if (key_s && (adj_y > -JOY_KEY_RELEASE_THRESHOLD)) next_s = false;
-    if (next_s != key_s) { key_s = next_s; uart_send_packet_flag(ID_KEY_S, key_s ? 1 : 0); }
+        bool next_s = key_s;
+        if (!key_s && (adj_y < -JOY_KEY_PRESS_THRESHOLD)) next_s = true;
+        if (key_s && (adj_y > -JOY_KEY_RELEASE_THRESHOLD)) next_s = false;
+        if (next_s != key_s) {
+            key_s = next_s;
+            uart_send_packet_flag(ID_KEY_S, key_s ? 1 : 0);
+            if (DEBUG_JOYSTICK) printf("KEY S -> %d (adj_y=%d)\r\n", key_s, adj_y);
+        }
 
-    // X -> D (right) / A (left) com histerese
-    bool next_d = key_d;
-    if (!key_d && (adj_x > JOY_KEY_PRESS_THRESHOLD)) next_d = true;
-    if (key_d && (adj_x < JOY_KEY_RELEASE_THRESHOLD)) next_d = false;
-    if (next_d != key_d) { key_d = next_d; uart_send_packet_flag(ID_KEY_D, key_d ? 1 : 0); }
+        // D / A (eixo X) usando macros de limiar (histerese)
+        bool next_d = key_d;
+        if (!key_d && (adj_x > JOY_KEY_PRESS_THRESHOLD)) next_d = true;
+        if (key_d && (adj_x < JOY_KEY_RELEASE_THRESHOLD)) next_d = false;
+        if (next_d != key_d) {
+            key_d = next_d;
+            uart_send_packet_flag(ID_KEY_D, key_d ? 1 : 0);
+            if (DEBUG_JOYSTICK) printf("KEY D -> %d (adj_x=%d)\r\n", key_d, adj_x);
+        }
 
-    bool next_a = key_a;
-    if (!key_a && (adj_x < -JOY_KEY_PRESS_THRESHOLD)) next_a = true;
-    if (key_a && (adj_x > -JOY_KEY_RELEASE_THRESHOLD)) next_a = false;
-    if (next_a != key_a) { key_a = next_a; uart_send_packet_flag(ID_KEY_A, key_a ? 1 : 0); }
+        bool next_a = key_a;
+        if (!key_a && (adj_x < -JOY_KEY_PRESS_THRESHOLD)) next_a = true;
+        if (key_a && (adj_x > -JOY_KEY_RELEASE_THRESHOLD)) next_a = false;
+        if (next_a != key_a) {
+            key_a = next_a;
+            uart_send_packet_flag(ID_KEY_A, key_a ? 1 : 0);
+            if (DEBUG_JOYSTICK) printf("KEY A -> %d (adj_x=%d)\r\n", key_a, adj_x);
+        }
 
         // envia joystick raw quando houver mudança (debug/telemetria)
         if (abs(joy_x) > JOY_SEND_THRESHOLD) {
@@ -303,11 +324,18 @@ void task_mpu_and_joy(void *p) {
             if (abs(last_sent_joy_y) > JOY_SEND_THRESHOLD) { out.joy_y = 0; last_sent_joy_y = 0; any = true; }
         }
 
+        // opcional: imprime resumo por loop (quando DEBUG_JOYSTICK && any)
+        if (DEBUG_JOYSTICK && any) {
+            printf("SENT -> joy_x=%d joy_y=%d | W=%d A=%d S=%d D=%d | pitch=%.1f roll=%.1f\r\n",
+                   out.joy_x, out.joy_y, key_w, key_a, key_s, key_d, pitch, roll);
+        }
+
         if (any) xQueueSend(q_mdata, &out, 0);
 
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
+
 
 // TASK: UART sender (sem mudanças)
 void task_uart(void *p) {
