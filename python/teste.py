@@ -1,5 +1,5 @@
 # teste.py — leitor simples: recebe pacotes 0xFF id low high
-# Agora: IMU só = clique direito do mouse. Movimentação do cursor IGNORADA.
+# Joystick: X -> A/D ; Y -> W/S. IMU -> right click.
 
 import serial
 import time
@@ -23,7 +23,7 @@ ID_KEY_W = 9
 ID_KEY_A = 10
 ID_KEY_S = 11
 ID_KEY_D = 12
-ID_KEY_E = 13
+# ID_KEY_E REMOVED
 
 BUTTON_KEYMAP = {
     ID_BTN_ATACK: 'f',
@@ -36,8 +36,7 @@ KEY_ID_MAP = {
     ID_KEY_W: 'w',
     ID_KEY_A: 'a',
     ID_KEY_S: 's',
-    ID_KEY_D: 'd',
-    ID_KEY_E: 'e'
+    ID_KEY_D: 'd'
 }
 
 def parse_int16(low, high):
@@ -53,9 +52,8 @@ def handle_packet(id_, low, high):
             print("click err", e)
         return
 
-    # ignorar movimentos IMU (IDs de movimento não enviados/ignorados)
     if id_ in (ID_JOY_X, ID_JOY_Y):
-        # opcional: usar para debug/remota — por enquanto ignora
+        # joystick raw: ignoramos no PC (MCU já envia W/A/S/D)
         return
 
     if id_ in BUTTON_KEYMAP:
