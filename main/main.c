@@ -54,8 +54,10 @@
 
 
 // joystick thresholds — ajuste se necessário
-#define JOY_DEADZONE            1500
-#define JOY_KEY_THRESHOLD       12000
+#define JOY_DEADZONE            2200    // deadzone maior reduz sensibilidade perto do centro
+// Histerese para teclas do joystick: pressiona em um limiar e solta em outro menor
+#define JOY_KEY_PRESS_THRESHOLD   16000
+#define JOY_KEY_RELEASE_THRESHOLD 12000
 #define JOY_SEND_THRESHOLD      2000
 #define JOY_MIN_CHANGE          800
 
@@ -184,6 +186,10 @@ void task_mpu_and_joy(void *p) {
     static int accel_over_count = 0;
     static int gyro_over_count  = 0;
 
+    // filtros EMA inteiros para reduzir ruído do ADC (alpha = 1/4)
+    static int32_t filt_raw_x = 2048;
+    static int32_t filt_raw_y = 2048;
+
     while (1) {
         mpu6050_read_raw(accel, gyro, &temp);
 
@@ -220,14 +226,18 @@ void task_mpu_and_joy(void *p) {
         if (accel[1] < CLICK_RESET_THRESHOLD_Y) can_click = true;
 
         // JOYSTICK read
-        adc_select_input(0);
-        uint16_t raw_x = adc_read();
-        adc_select_input(1);
-        uint16_t raw_y = adc_read();
+    adc_select_input(0);
+    uint16_t raw_x = adc_read();
+    adc_select_input(1);
+    uint16_t raw_y = adc_read();
+
+    // Filtro EMA simples (inteiro): new = old + (measured - old)/4
+    filt_raw_x += ((int32_t)raw_x - filt_raw_x) >> 2;
+    filt_raw_y += ((int32_t)raw_y - filt_raw_y) >> 2;
 
         // mapear 0..4095 -> centered signed *16 (mesma escala que antes)
-        int32_t tmpx = ((int32_t)raw_x - 2048) * 16;
-        int32_t tmpy = ((int32_t)raw_y - 2048) * 16;
+    int32_t tmpx = (filt_raw_x - 2048) * 16;
+    int32_t tmpy = (filt_raw_y - 2048) * 16;
 
         // aplicar inversão se necessário
         if (INVERT_X) tmpx = -tmpx;
@@ -250,17 +260,27 @@ void task_mpu_and_joy(void *p) {
         int16_t adj_x = (abs(joy_x) < JOY_DEADZONE) ? 0 : joy_x;
         int16_t adj_y = (abs(joy_y) < JOY_DEADZONE) ? 0 : joy_y;
 
-        // Y -> W (up) / S (down)
-        bool should_w = (adj_y > JOY_KEY_THRESHOLD);
-        bool should_s = (adj_y < -JOY_KEY_THRESHOLD);
-        if (should_w != key_w) { key_w = should_w; uart_send_packet_flag(ID_KEY_W, key_w ? 1 : 0); }
-        if (should_s != key_s) { key_s = should_s; uart_send_packet_flag(ID_KEY_S, key_s ? 1 : 0); }
+    // Y -> W (up) / S (down) com histerese
+    bool next_w = key_w;
+    if (!key_w && (adj_y > JOY_KEY_PRESS_THRESHOLD)) next_w = true;
+    if (key_w && (adj_y < JOY_KEY_RELEASE_THRESHOLD)) next_w = false;
+    if (next_w != key_w) { key_w = next_w; uart_send_packet_flag(ID_KEY_W, key_w ? 1 : 0); }
 
-        // X -> D (right) / A (left)
-        bool should_d = (adj_x > JOY_KEY_THRESHOLD);
-        bool should_a = (adj_x < -JOY_KEY_THRESHOLD);
-        if (should_d != key_d) { key_d = should_d; uart_send_packet_flag(ID_KEY_D, key_d ? 1 : 0); }
-        if (should_a != key_a) { key_a = should_a; uart_send_packet_flag(ID_KEY_A, key_a ? 1 : 0); }
+    bool next_s = key_s;
+    if (!key_s && (adj_y < -JOY_KEY_PRESS_THRESHOLD)) next_s = true;
+    if (key_s && (adj_y > -JOY_KEY_RELEASE_THRESHOLD)) next_s = false;
+    if (next_s != key_s) { key_s = next_s; uart_send_packet_flag(ID_KEY_S, key_s ? 1 : 0); }
+
+    // X -> D (right) / A (left) com histerese
+    bool next_d = key_d;
+    if (!key_d && (adj_x > JOY_KEY_PRESS_THRESHOLD)) next_d = true;
+    if (key_d && (adj_x < JOY_KEY_RELEASE_THRESHOLD)) next_d = false;
+    if (next_d != key_d) { key_d = next_d; uart_send_packet_flag(ID_KEY_D, key_d ? 1 : 0); }
+
+    bool next_a = key_a;
+    if (!key_a && (adj_x < -JOY_KEY_PRESS_THRESHOLD)) next_a = true;
+    if (key_a && (adj_x > -JOY_KEY_RELEASE_THRESHOLD)) next_a = false;
+    if (next_a != key_a) { key_a = next_a; uart_send_packet_flag(ID_KEY_A, key_a ? 1 : 0); }
 
         // envia joystick raw quando houver mudança (debug/telemetria)
         if (abs(joy_x) > JOY_SEND_THRESHOLD) {
