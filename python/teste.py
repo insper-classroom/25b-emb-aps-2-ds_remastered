@@ -1,4 +1,5 @@
-# teste.py - atualizado para: IMU -> clique direito; Joystick -> W A S D E
+# teste.py - atualizado com prints de debug e ajustes
+# baseado na sua versão original (IMU -> clique direito; Joystick -> WASDE)
 import sys
 import glob
 import serial
@@ -9,6 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
 import threading
+import time
 
 # ----------------- CONFIG / MAPEAMENTO DE IDs -----------------
 AXIS_IMU_X = 0
@@ -32,10 +34,11 @@ BUTTON_KEYMAP = {
 }
 
 # ----------------- SENSIBILIDADES / THRESHOLDS -----------------
-IMU_MOVE_SCALE = 4          # usado anteriormente para IMU movimento
-JOY_DEADZONE = 4000         # valores absolutos abaixo disto -> considerado neutro
-JOY_KEY_THRESHOLD = 4000    # limiar para considerar direção (parecido com deadzone)
-DIAGONAL_E_THRESHOLD = 20000  # se |x|>this e |y|>this -> dispara 'e'
+IMU_MOVE_SCALE = 4          # escala para movimento do mouse vindo da IMU
+# ADC no firmware: raw-> ((raw-2048)*16) => ~ -32768..+32767
+JOY_KEY_THRESHOLD = 12000    # ajuste: limiar para considerar direção (faça tuning)
+DIAGONAL_E_THRESHOLD = 20000 # se |x|>this e |y|>this -> dispara 'e'
+# se achar que está muito sensível, aumente JOY_KEY_THRESHOLD ou DIAGONAL_E_THRESHOLD
 
 # ----------------- Estado de teclas (para enviar keyDown/keyUp uma vez) ----------
 key_state = {
@@ -54,6 +57,7 @@ def key_down_if_needed(key):
         except Exception as e:
             print("Erro keyDown:", e)
         key_state[key] = True
+        print(f"[KEY DOWN] {key}")
 
 def key_up_if_needed(key):
     if key_state.get(key, False):
@@ -62,22 +66,30 @@ def key_up_if_needed(key):
         except Exception as e:
             print("Erro keyUp:", e)
         key_state[key] = False
+        print(f"[KEY UP] {key}")
 
 def release_all_movement_keys():
     for k in ('w','a','s','d','e'):
         key_up_if_needed(k)
 
 def move_mouse(axis, value):
-    """Usado para IMU movimento (IDs 0/1) e joystick opcional se quiser.
-       Aqui mantemos movimento do IMU como antes (mas já scaleado no firmware)."""
+    """IMU movimento: axis==AXIS_IMU_X => movimento X, AXIS_IMU_Y => Y.
+       value já chega como signed int16 escalado pelo firmware."""
     if axis == AXIS_IMU_X:
-        pyautogui.moveRel(int(value * IMU_MOVE_SCALE), 0)
+        dx = int(value * IMU_MOVE_SCALE)
+        if dx != 0:
+            pyautogui.moveRel(dx, 0)
+        print(f"[MOUSE] IMU X move: raw={value} scaled={dx}")
     elif axis == AXIS_IMU_Y:
-        pyautogui.moveRel(0, int(value * IMU_MOVE_SCALE))
+        dy = int(value * IMU_MOVE_SCALE)
+        if dy != 0:
+            pyautogui.moveRel(0, dy)
+        print(f"[MOUSE] IMU Y move: raw={value} scaled={dy}")
 
 def handle_click_right(value):
-    """IMU click (ID 2) agora faz clique direito único quando value != 0."""
+    """IMU click (ID 2) -> clique direito único quando value != 0."""
     if value != 0:
+        print(f"[CLICK] IMU click detected value={value} -> right click")
         try:
             pyautogui.click(button='right')
         except Exception as e:
@@ -87,14 +99,17 @@ def handle_button(id_, value):
     """Trata botões físicos com keyDown/keyUp."""
     key = BUTTON_KEYMAP.get(id_)
     if not key:
-        print(f"Botão com ID {id_} não mapeado.")
+        print(f"[BTN] Botão com ID {id_} não mapeado. value={value}")
         return
     if value != 0:
+        print(f"[BTN] ID {id_} PRESSED -> keyDown {key}")
         try:
             pyautogui.keyDown(key)
         except Exception as e:
             print("Erro em keyDown:", e)
+        # opcional: não setamos key_state aqui, pois são botões momentâneos
     else:
+        print(f"[BTN] ID {id_} RELEASED -> keyUp {key}")
         try:
             pyautogui.keyUp(key)
         except Exception as e:
@@ -106,14 +121,17 @@ def handle_joystick(x_value, y_value):
     Mapeia para W A S D e E (diagonal forte).
     Usa histerese implícita via key_state (só envia keyDown uma vez).
     """
+    # DEBUG
+    print(f"[JOY] raw x={x_value} y={y_value}")
+
     # Diagonal forte -> 'e'
     if abs(x_value) > DIAGONAL_E_THRESHOLD and abs(y_value) > DIAGONAL_E_THRESHOLD:
         key_down_if_needed('e')
     else:
         key_up_if_needed('e')
 
-    # Vertical: up = W (y positive?), depende de como firmware envia
-    # Assumo que joystick físico pra cima gera valor positivo (ajuste se necessário)
+    # Vertical: assumo joystick pra cima => y positivo no firmware.
+    # Se na prática estiver invertido, troque os sinais aqui.
     if y_value > JOY_KEY_THRESHOLD:
         key_down_if_needed('w')
         key_up_if_needed('s')
@@ -137,9 +155,11 @@ def handle_joystick(x_value, y_value):
 
 # ----------------- SERIAL / PARSE -----------------
 def parse_data(data):
+    """Recebe 3 bytes: id (1 byte), value low, value high (little-endian signed)"""
     if len(data) < 3:
         return None, None
     id_ = data[0]
+    # little-endian signed 16-bit
     value = int.from_bytes(data[1:3], byteorder='little', signed=True)
     return id_, value
 
@@ -156,38 +176,42 @@ def controle(ser):
             if not sync:
                 continue
             if sync[0] != 0xFF:
+                # ressincronizar se byte inválido
+                print(f"[SYNC] Byte inesperado: {sync[0]:02X}, aguardando 0xFF...")
                 continue
             data = ser.read(size=3)
             if len(data) < 3:
+                # timeout parcial
                 continue
-
-            # DEBUG
-            # print("RAW:", sync.hex(), data.hex())
 
             id_, value = parse_data(data)
             if id_ is None:
                 continue
 
+            # DEBUG: print recebido cru
+            print(f"[RX] id={id_} value={value}")
+
             # Tratamento por ID
             if id_ == AXIS_IMU_X or id_ == AXIS_IMU_Y:
-                # Mantemos movimento IMU, opcional
                 move_mouse(id_, value)
             elif id_ == AXIS_IMU_CLICK:
-                # Antes fazia mouseDown/mouseUp; agora clique direito único
                 handle_click_right(value)
             elif id_ in BUTTON_KEYMAP:
                 handle_button(id_, value)
             elif id_ == JOY_X_ID:
                 last_joy_x = value
+                # processa combinando com last_joy_y (se ambos estiverem em movimento, 'e' pode disparar)
                 handle_joystick(last_joy_x, last_joy_y)
             elif id_ == JOY_Y_ID:
                 last_joy_y = value
                 handle_joystick(last_joy_x, last_joy_y)
             else:
-                print(f"ID desconhecido recebido: {id_} value={value}")
+                print(f"[WARN] ID desconhecido recebido: {id_} value={value}")
 
     except serial.SerialException as e:
         print("SerialException:", e)
+    except KeyboardInterrupt:
+        print("Ctrl-C recebido, saindo...")
     except Exception as e:
         print("Erro no loop de leitura:", e)
     finally:
@@ -199,7 +223,7 @@ def controle(ser):
         # soltar todas as teclas caso saia
         release_all_movement_keys()
 
-# ----------------- GUI / PORTA (mesmo que antes) -----------------
+# ----------------- GUI / PORTA -----------------
 def serial_ports():
     ports = []
     if sys.platform.startswith('win'):
@@ -212,7 +236,7 @@ def serial_ports():
             except (OSError, serial.SerialException):
                 pass
     elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
-        ports = glob.glob('/dev/tty[A-Za-z]*')
+        ports = glob.glob('/dev/tty[A-Za-z0-9]*')
     elif sys.platform.startswith('darwin'):
         ports = glob.glob('/dev/tty.*')
     else:
@@ -316,4 +340,5 @@ def criar_janela():
     root.mainloop()
 
 if __name__ == "__main__":
+    print("Iniciando GUI do controle. Abra o terminal para ver logs de debug.")
     criar_janela()
