@@ -1,14 +1,16 @@
-# teste.py - atualizado com prints de debug e ajustes
-# baseado na sua versão original (IMU -> clique direito; Joystick -> WASDE)
+# teste.py - versão sem calibração do joystick, botões corrigidos
+# IMU -> clique direito, Joystick -> WASD (+ E para diagonal)
+# Não faz calibração que bloqueie; joystick usa deadzone no cliente.
+
 import sys
 import glob
 import serial
+from serial.tools import list_ports
 import pyautogui
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
 import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox
+from tkinter import ttk, messagebox
 import threading
 import time
 
@@ -25,7 +27,6 @@ BTN_ESC_ID   = 6
 JOY_X_ID = 7
 JOY_Y_ID = 8
 
-# Mapeamento de botão -> tecla (mantive para seus botões físicos)
 BUTTON_KEYMAP = {
     BTN_ATACK_ID: 'f',
     BTN_CURA_ID:  'q',
@@ -35,10 +36,12 @@ BUTTON_KEYMAP = {
 
 # ----------------- SENSIBILIDADES / THRESHOLDS -----------------
 IMU_MOVE_SCALE = 4          # escala para movimento do mouse vindo da IMU
-# ADC no firmware: raw-> ((raw-2048)*16) => ~ -32768..+32767
-JOY_KEY_THRESHOLD = 12000    # ajuste: limiar para considerar direção (faça tuning)
-DIAGONAL_E_THRESHOLD = 20000 # se |x|>this e |y|>this -> dispara 'e'
-# se achar que está muito sensível, aumente JOY_KEY_THRESHOLD ou DIAGONAL_E_THRESHOLD
+JOY_KEY_THRESHOLD = 12000   # valor absoluto necessário para considerar direcional
+DIAGONAL_E_THRESHOLD = 20000
+
+# Deadzone/filters on PC (no calibration)
+JOY_DEADZONE = 1500         # if |value| < deadzone => treat as zero
+JOY_CHANGE_MIN = 800        # minimal change to trigger processing (rate-limit)
 
 # ----------------- Estado de teclas (para enviar keyDown/keyUp uma vez) ----------
 key_state = {
@@ -49,7 +52,15 @@ key_state = {
     'e': False
 }
 
-# ----------------- UTILS -----------------
+last_raw_x = 0
+last_raw_y = 0
+last_adj_x = 0
+last_adj_y = 0
+
+# Verbose -> True para debug completo (muitos prints). False para uso normal.
+VERBOSE = False
+
+# ----------------- HELPERS -----------------
 def key_down_if_needed(key):
     if not key_state.get(key, False):
         try:
@@ -73,21 +84,20 @@ def release_all_movement_keys():
         key_up_if_needed(k)
 
 def move_mouse(axis, value):
-    """IMU movimento: axis==AXIS_IMU_X => movimento X, AXIS_IMU_Y => Y.
-       value já chega como signed int16 escalado pelo firmware."""
+    # value is signed int16 from firmware
     if axis == AXIS_IMU_X:
         dx = int(value * IMU_MOVE_SCALE)
         if dx != 0:
             pyautogui.moveRel(dx, 0)
-        print(f"[MOUSE] IMU X move: raw={value} scaled={dx}")
+        if VERBOSE: print(f"[MOUSE] IMU X move: raw={value} scaled={dx}")
     elif axis == AXIS_IMU_Y:
         dy = int(value * IMU_MOVE_SCALE)
         if dy != 0:
             pyautogui.moveRel(0, dy)
-        print(f"[MOUSE] IMU Y move: raw={value} scaled={dy}")
+        if VERBOSE: print(f"[MOUSE] IMU Y move: raw={value} scaled={dy}")
 
 def handle_click_right(value):
-    """IMU click (ID 2) -> clique direito único quando value != 0."""
+    # firmware sends 1 when gesture detected
     if value != 0:
         print(f"[CLICK] IMU click detected value={value} -> right click")
         try:
@@ -96,117 +106,138 @@ def handle_click_right(value):
             print("Erro em right-click:", e)
 
 def handle_button(id_, value):
-    """Trata botões físicos com keyDown/keyUp."""
+    # value: 1 = pressed, 0 = released (as firmware sends)
     key = BUTTON_KEYMAP.get(id_)
     if not key:
-        print(f"[BTN] Botão com ID {id_} não mapeado. value={value}")
+        if VERBOSE: print(f"[BTN] Botão com ID {id_} não mapeado. value={value}")
         return
     if value != 0:
-        print(f"[BTN] ID {id_} PRESSED -> keyDown {key}")
+        # press
+        print(f"[BTN] ID {id_} PRESSED -> {key}")
         try:
             pyautogui.keyDown(key)
         except Exception as e:
             print("Erro em keyDown:", e)
-        # opcional: não setamos key_state aqui, pois são botões momentâneos
     else:
-        print(f"[BTN] ID {id_} RELEASED -> keyUp {key}")
+        # release
+        print(f"[BTN] ID {id_} RELEASED -> {key}")
         try:
             pyautogui.keyUp(key)
         except Exception as e:
             print("Erro em keyUp:", e)
 
-def handle_joystick(x_value, y_value):
-    """
-    x_value, y_value são signed int16 de -32768..+32767 (conforme firmware).
-    Mapeia para W A S D e E (diagonal forte).
-    Usa histerese implícita via key_state (só envia keyDown uma vez).
-    """
-    # DEBUG
-    print(f"[JOY] raw x={x_value} y={y_value}")
+# ----------------- PARSE -----------------
+def parse_data(data):
+    """Recebe 3 bytes: id (1 byte), value low, value high (little-endian signed)"""
+    if len(data) < 3:
+        return None, None
+    id_ = data[0]
+    value = int.from_bytes(data[1:3], byteorder='little', signed=True)
+    return id_, value
 
-    # Diagonal forte -> 'e'
-    if abs(x_value) > DIAGONAL_E_THRESHOLD and abs(y_value) > DIAGONAL_E_THRESHOLD:
+# ----------------- JOYSTICK HANDLER (sem calibração) ----------
+def handle_joystick(raw_x, raw_y):
+    """
+    raw_x/raw_y are signed int16 from firmware.
+    Apply deadzone and only act on significant changes.
+    """
+    global last_adj_x, last_adj_y
+
+    # adjust by deadzone: treat small values as zero
+    adj_x = 0 if abs(raw_x) < JOY_DEADZONE else raw_x
+    adj_y = 0 if abs(raw_y) < JOY_DEADZONE else raw_y
+
+    # quick exit: if both adj are zero, release keys if any pressed
+    if adj_x == 0 and adj_y == 0:
+        if any(key_state[k] for k in ('w','a','s','d','e')):
+            release_all_movement_keys()
+        # update lasts
+        last_adj_x = 0
+        last_adj_y = 0
+        return
+
+    # rate-limit: avoid handling very small oscillations
+    if abs(adj_x - last_adj_x) < JOY_CHANGE_MIN and abs(adj_y - last_adj_y) < JOY_CHANGE_MIN:
+        return
+
+    last_adj_x = adj_x
+    last_adj_y = adj_y
+
+    # Diagonal strong -> 'e'
+    if abs(adj_x) > DIAGONAL_E_THRESHOLD and abs(adj_y) > DIAGONAL_E_THRESHOLD:
         key_down_if_needed('e')
     else:
         key_up_if_needed('e')
 
-    # Vertical: assumo joystick pra cima => y positivo no firmware.
-    # Se na prática estiver invertido, troque os sinais aqui.
-    if y_value > JOY_KEY_THRESHOLD:
+    # Vertical (assumes positive y = up; invert if needed)
+    if adj_y > JOY_KEY_THRESHOLD:
         key_down_if_needed('w')
         key_up_if_needed('s')
-    elif y_value < -JOY_KEY_THRESHOLD:
+    elif adj_y < -JOY_KEY_THRESHOLD:
         key_down_if_needed('s')
         key_up_if_needed('w')
     else:
         key_up_if_needed('w')
         key_up_if_needed('s')
 
-    # Horizontal: right = D, left = A
-    if x_value > JOY_KEY_THRESHOLD:
+    # Horizontal
+    if adj_x > JOY_KEY_THRESHOLD:
         key_down_if_needed('d')
         key_up_if_needed('a')
-    elif x_value < -JOY_KEY_THRESHOLD:
+    elif adj_x < -JOY_KEY_THRESHOLD:
         key_down_if_needed('a')
         key_up_if_needed('d')
     else:
         key_up_if_needed('a')
         key_up_if_needed('d')
 
-# ----------------- SERIAL / PARSE -----------------
-def parse_data(data):
-    """Recebe 3 bytes: id (1 byte), value low, value high (little-endian signed)"""
-    if len(data) < 3:
-        return None, None
-    id_ = data[0]
-    # little-endian signed 16-bit
-    value = int.from_bytes(data[1:3], byteorder='little', signed=True)
-    return id_, value
+    # print brief state
+    print(f"[JOY STATE] adj_x={adj_x} adj_y={adj_y} -> keys: "
+          f"{'w' if key_state['w'] else ''}{'a' if key_state['a'] else ''}"
+          f"{'s' if key_state['s'] else ''}{'d' if key_state['d'] else ''}"
+          f"{' e' if key_state['e'] else ''}".strip())
 
-# We keep last read joystick values to combine X and Y when they arrive individually
-last_joy_x = 0
-last_joy_y = 0
-
+# ----------------- SERIAL / LOOP PRINCIPAL -----------------
 def controle(ser):
-    global last_joy_x, last_joy_y
-    print("Iniciando loop serial (IMU->right-click; Joystick->WASDE)...")
+    # no calibration: start reading right away
+    print("Loop pronto. Sem calibração de joystick. Pressione botões ou mova joystick.")
+    global last_raw_x, last_raw_y
     try:
         while True:
             sync = ser.read(size=1)
             if not sync:
                 continue
             if sync[0] != 0xFF:
-                # ressincronizar se byte inválido
-                print(f"[SYNC] Byte inesperado: {sync[0]:02X}, aguardando 0xFF...")
+                # resync quickly
+                if VERBOSE: print(f"[SYNC] ignorando byte {sync[0]:02X}")
                 continue
             data = ser.read(size=3)
             if len(data) < 3:
-                # timeout parcial
                 continue
-
             id_, value = parse_data(data)
             if id_ is None:
                 continue
 
-            # DEBUG: print recebido cru
-            print(f"[RX] id={id_} value={value}")
+            if VERBOSE:
+                print(f"[RX] id={id_} value={value}")
 
-            # Tratamento por ID
             if id_ == AXIS_IMU_X or id_ == AXIS_IMU_Y:
                 move_mouse(id_, value)
             elif id_ == AXIS_IMU_CLICK:
                 handle_click_right(value)
             elif id_ in BUTTON_KEYMAP:
+                # value: 1 pressed, 0 released (firmware sends that)
                 handle_button(id_, value)
             elif id_ == JOY_X_ID:
-                last_joy_x = value
-                # processa combinando com last_joy_y (se ambos estiverem em movimento, 'e' pode disparar)
-                handle_joystick(last_joy_x, last_joy_y)
+                last_raw_x = value
+                # combine with last_raw_y to decide
+                handle_joystick(last_raw_x, last_raw_y)
             elif id_ == JOY_Y_ID:
-                last_joy_y = value
-                handle_joystick(last_joy_x, last_joy_y)
+                last_raw_y = value
+                handle_joystick(last_raw_x, last_raw_y)
             else:
-                print(f"[WARN] ID desconhecido recebido: {id_} value={value}")
+                if VERBOSE:
+                    print(f"[WARN] ID desconhecido: {id_} value={value}")
 
     except serial.SerialException as e:
         print("SerialException:", e)
@@ -220,43 +251,27 @@ def controle(ser):
         except:
             pass
         print("Conexão serial fechada.")
-        # soltar todas as teclas caso saia
         release_all_movement_keys()
 
-# ----------------- GUI / PORTA -----------------
+# ----------------- GUI / PORTAS -----------------
 def serial_ports():
-    ports = []
-    if sys.platform.startswith('win'):
-        for i in range(1, 256):
-            port = f'COM{i}'
-            try:
-                s = serial.Serial(port)
-                s.close()
-                ports.append(port)
-            except (OSError, serial.SerialException):
-                pass
-    elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
-        ports = glob.glob('/dev/tty[A-Za-z0-9]*')
-    elif sys.platform.startswith('darwin'):
-        ports = glob.glob('/dev/tty.*')
-    else:
-        raise EnvironmentError('Plataforma não suportada.')
-
-    result = []
-    for port in ports:
-        try:
-            s = serial.Serial(port)
-            s.close()
-            result.append(port)
-        except (OSError, serial.SerialException):
-            pass
-    return result
+    """Lista portas sem abrir (rápido)."""
+    try:
+        return [p.device for p in list_ports.comports()]
+    except Exception:
+        # fallback simples
+        if sys.platform.startswith('win'):
+            return [f'COM{i}' for i in range(1, 21)]
+        elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
+            return glob.glob('/dev/tty[A-Za-z0-9]*')
+        elif sys.platform.startswith('darwin'):
+            return glob.glob('/dev/tty.*')
+        return []
 
 def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circulo):
     if not port_name:
         messagebox.showwarning("Aviso", "Selecione uma porta serial antes de conectar.")
         return
-
     try:
         ser = serial.Serial(port_name, 115200, timeout=0.1)
         status_label.config(text=f"Conectado em {port_name}", foreground="green")
@@ -265,80 +280,53 @@ def conectar_porta(port_name, root, botao_conectar, status_label, mudar_cor_circ
         root.update()
         t = threading.Thread(target=controle, args=(ser,), daemon=True)
         t.start()
-    except KeyboardInterrupt:
-        print("Encerrando via KeyboardInterrupt.")
     except Exception as e:
         messagebox.showerror("Erro de Conexão", f"Não foi possível conectar em {port_name}.\nErro: {e}")
         mudar_cor_circulo("red")
 
 def criar_janela():
     root = tk.Tk()
-    root.title("Controle de Mouse")
-    root.geometry("400x250")
+    root.title("Controle")
+    root.geometry("420x200")
     root.resizable(False, False)
-    dark_bg = "#2e2e2e"
-    dark_fg = "#ffffff"
-    accent_color = "#007acc"
-    root.configure(bg=dark_bg)
 
-    style = ttk.Style(root)
-    style.theme_use("clam")
-    style.configure("TFrame", background=dark_bg)
-    style.configure("TLabel", background=dark_bg, foreground=dark_fg, font=("Segoe UI", 11))
-    style.configure("TButton", font=("Segoe UI", 10, "bold"),
-                    foreground=dark_fg, background="#444444", borderwidth=0)
-    style.map("TButton", background=[("active", "#555555")])
-    style.configure("Accent.TButton", font=("Segoe UI", 12, "bold"),
-                    foreground=dark_fg, background=accent_color, padding=6)
-    style.map("Accent.TButton", background=[("active", "#005f9e")])
-    style.configure("TCombobox",
-                    fieldbackground=dark_bg,
-                    background=dark_bg,
-                    foreground=dark_fg,
-                    padding=4)
-    style.map("TCombobox", fieldbackground=[("readonly", dark_bg)])
+    frame = ttk.Frame(root, padding=12)
+    frame.pack(expand=True, fill="both")
 
-    frame_principal = ttk.Frame(root, padding="20")
-    frame_principal.pack(expand=True, fill="both")
-
-    titulo_label = ttk.Label(frame_principal, text="Controle de Mouse", font=("Segoe UI", 14, "bold"))
-    titulo_label.pack(pady=(0, 10))
+    titulo = ttk.Label(frame, text="Controle (IMU/Joystick)", font=("Segoe UI", 13, "bold"))
+    titulo.pack(pady=(0,10))
 
     porta_var = tk.StringVar(value="")
 
     botao_conectar = ttk.Button(
-        frame_principal,
-        text="Conectar e Iniciar Leitura",
-        style="Accent.TButton",
+        frame,
+        text="Conectar (sem calibração)",
         command=lambda: conectar_porta(porta_var.get(), root, botao_conectar, status_label, mudar_cor_circulo)
     )
     botao_conectar.pack(pady=10)
 
-    footer_frame = tk.Frame(root, bg=dark_bg)
-    footer_frame.pack(side="bottom", fill="x", padx=10, pady=(10, 0))
+    footer = tk.Frame(root)
+    footer.pack(side="bottom", fill="x", padx=10, pady=(6,10))
 
-    status_label = tk.Label(footer_frame, text="Aguardando seleção de porta...", font=("Segoe UI", 11),
-                            bg=dark_bg, fg=dark_fg)
+    status_label = tk.Label(footer, text="Aguardando seleção de porta...", font=("Segoe UI", 10))
     status_label.grid(row=0, column=0, sticky="w")
 
-    portas_disponiveis = serial_ports()
-    if portas_disponiveis:
-        porta_var.set(portas_disponiveis[0])
-    port_dropdown = ttk.Combobox(footer_frame, textvariable=porta_var,
-                                 values=portas_disponiveis, state="readonly", width=10)
-    port_dropdown.grid(row=0, column=1, padx=10)
+    portas = serial_ports()
+    if portas:
+        porta_var.set(portas[0])
+    port_dropdown = ttk.Combobox(footer, textvariable=porta_var, values=portas, state="readonly", width=14)
+    port_dropdown.grid(row=0, column=1, padx=8)
 
-    circle_canvas = tk.Canvas(footer_frame, width=20, height=20, highlightthickness=0, bg=dark_bg)
-    circle_item = circle_canvas.create_oval(2, 2, 18, 18, fill="red", outline="")
-    circle_canvas.grid(row=0, column=2, sticky="e")
+    circle = tk.Canvas(footer, width=18, height=18, highlightthickness=0)
+    circle_item = circle.create_oval(2,2,16,16, fill="red", outline="")
+    circle.grid(row=0, column=2, padx=6)
 
-    footer_frame.columnconfigure(1, weight=1)
+    def mudar_cor_circulo(c):
+        circle.itemconfig(circle_item, fill=c)
 
-    def mudar_cor_circulo(cor):
-        circle_canvas.itemconfig(circle_item, fill=cor)
-
+    footer.columnconfigure(1, weight=1)
     root.mainloop()
 
 if __name__ == "__main__":
-    print("Iniciando GUI do controle. Abra o terminal para ver logs de debug.")
+    print("Iniciando GUI. Logs aparecerão no terminal. Sem calibração de joystick.")
     criar_janela()
