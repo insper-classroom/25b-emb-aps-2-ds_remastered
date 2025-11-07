@@ -48,7 +48,9 @@
 #define CLICK_ACCEL_THRESHOLD_Y   32000    // antes 25000
 #define CLICK_RESET_THRESHOLD_Y   2000     // antes 1000
 #define CLICK_GYRO_THRESHOLD      3500     // antes 1800
-#define IMU_CLICK_DEBOUNCE_MS     300      // antes 180
+#define IMU_CLICK_DEBOUNCE_MS     400      // leve aumento para reduzir disparos muito frequentes
+// número de amostras consecutivas necessárias acima do limiar para considerar clique
+#define IMU_REQUIRED_SAMPLES      3
 
 
 // joystick thresholds — ajuste se necessário
@@ -178,6 +180,10 @@ void task_mpu_and_joy(void *p) {
     bool key_w = false, key_a = false, key_s = false, key_d = false;
     int16_t last_sent_joy_x = 0, last_sent_joy_y = 0;
 
+    // contadores para exigir múltiplas leituras consecutivas acima do limiar
+    static int accel_over_count = 0;
+    static int gyro_over_count  = 0;
+
     while (1) {
         mpu6050_read_raw(accel, gyro, &temp);
 
@@ -187,22 +193,30 @@ void task_mpu_and_joy(void *p) {
         out.joy_y = 0;
         bool any = false;
 
-        // clique IMU (mantido — acel ou gyro)
+        // clique IMU com confirmação por múltiplas amostras
+        // acumula contagens quando acima do limiar, zera quando abaixo
         if (accel[1] > CLICK_ACCEL_THRESHOLD_Y) {
+            if (accel_over_count < IMU_REQUIRED_SAMPLES) accel_over_count++;
+        } else {
+            accel_over_count = 0;
+        }
+
+        int32_t gz = abs(gyro[2]);
+        int32_t gx = abs(gyro[0]);
+        if ((gx > CLICK_GYRO_THRESHOLD || gz > CLICK_GYRO_THRESHOLD)) {
+            if (gyro_over_count < IMU_REQUIRED_SAMPLES) gyro_over_count++;
+        } else {
+            gyro_over_count = 0;
+        }
+
+        bool click_condition = (accel_over_count >= IMU_REQUIRED_SAMPLES) || (gyro_over_count >= IMU_REQUIRED_SAMPLES);
+        if (click_condition) {
             uint64_t now = to_us_since_boot(get_absolute_time()) / 1000ULL;
             if (can_click && (now - last_click_ts) > IMU_CLICK_DEBOUNCE_MS) {
                 out.click = true; any = true; last_click_ts = now; can_click = false;
             }
-        } else {
-            int32_t gz = abs(gyro[2]);
-            int32_t gx = abs(gyro[0]);
-            if ((gx > CLICK_GYRO_THRESHOLD || gz > CLICK_GYRO_THRESHOLD)) {
-                uint64_t now = to_us_since_boot(get_absolute_time()) / 1000ULL;
-                if (can_click && (now - last_click_ts) > IMU_CLICK_DEBOUNCE_MS) {
-                    out.click = true; any = true; last_click_ts = now; can_click = false;
-                }
-            }
         }
+        // libera para novo clique quando o eixo Y de aceleração cai abaixo do limiar de reset
         if (accel[1] < CLICK_RESET_THRESHOLD_Y) can_click = true;
 
         // JOYSTICK read
