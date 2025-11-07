@@ -21,8 +21,8 @@
 #include "mpu6050.h"
 
 // ================= CONFIGURAÇÃO RÁPIDA =================
-#define INVERT_X 0   // 0 = normal, 1 = inverte sinal X
-#define INVERT_Y 0   // 0 = normal, 1 = inverte sinal Y
+#define INVERT_X 1   // 0 = normal, 1 = inverte sinal X
+#define INVERT_Y 1   // 0 = normal, 1 = inverte sinal Y
 #define DEBUG_JOYSTICK 1 // 1 = imprime joy_x/joy_y na serial (útil pra calibrar) ; depois opcional desligar
 // ======================================================
 
@@ -48,9 +48,9 @@
 #define CLICK_ACCEL_THRESHOLD_Y   32000    // antes 25000
 #define CLICK_RESET_THRESHOLD_Y   2000     // antes 1000
 #define CLICK_GYRO_THRESHOLD      3500     // antes 1800
-#define IMU_CLICK_DEBOUNCE_MS     400      // leve aumento para reduzir disparos muito frequentes
+#define IMU_CLICK_DEBOUNCE_MS     450      // um pouco mais de debounce
 // número de amostras consecutivas necessárias acima do limiar para considerar clique
-#define IMU_REQUIRED_SAMPLES      3
+#define IMU_REQUIRED_SAMPLES      4
 
 
 // joystick thresholds — ajuste se necessário
@@ -182,7 +182,11 @@ void task_mpu_and_joy(void *p) {
     bool key_w = false, key_a = false, key_s = false, key_d = false;
     int16_t last_sent_joy_x = 0, last_sent_joy_y = 0;
 
-    // contadores para exigir múltiplas leituras consecutivas acima do limiar
+    // filtros simples (EMA) e contadores para exigir múltiplas leituras consecutivas acima do limiar
+    static float filt_acc_y = 0.0f;
+    static float filt_gyro_x = 0.0f;
+    static float filt_gyro_z = 0.0f;
+    const float ALPHA_IMU = 0.3f; // 0..1 (menor = mais suave)
     static int accel_over_count = 0;
     static int gyro_over_count  = 0;
 
@@ -199,16 +203,21 @@ void task_mpu_and_joy(void *p) {
         out.joy_y = 0;
         bool any = false;
 
-        // clique IMU com confirmação por múltiplas amostras
+        // atualizar filtros (convertendo para float para manter simples)
+        filt_acc_y  += ALPHA_IMU * ((float)accel[1] - filt_acc_y);
+        filt_gyro_x += ALPHA_IMU * ((float)gyro[0]   - filt_gyro_x);
+        filt_gyro_z += ALPHA_IMU * ((float)gyro[2]   - filt_gyro_z);
+
+        // clique IMU com confirmação por múltiplas amostras usando valores filtrados
         // acumula contagens quando acima do limiar, zera quando abaixo
-        if (accel[1] > CLICK_ACCEL_THRESHOLD_Y) {
+        if (filt_acc_y > CLICK_ACCEL_THRESHOLD_Y) {
             if (accel_over_count < IMU_REQUIRED_SAMPLES) accel_over_count++;
         } else {
             accel_over_count = 0;
         }
 
-        int32_t gz = abs(gyro[2]);
-        int32_t gx = abs(gyro[0]);
+        int32_t gz = (int32_t)fabsf(filt_gyro_z);
+        int32_t gx = (int32_t)fabsf(filt_gyro_x);
         if ((gx > CLICK_GYRO_THRESHOLD || gz > CLICK_GYRO_THRESHOLD)) {
             if (gyro_over_count < IMU_REQUIRED_SAMPLES) gyro_over_count++;
         } else {
@@ -223,7 +232,7 @@ void task_mpu_and_joy(void *p) {
             }
         }
         // libera para novo clique quando o eixo Y de aceleração cai abaixo do limiar de reset
-        if (accel[1] < CLICK_RESET_THRESHOLD_Y) can_click = true;
+    if (filt_acc_y < CLICK_RESET_THRESHOLD_Y) can_click = true;
 
         // JOYSTICK read
     adc_select_input(0);
