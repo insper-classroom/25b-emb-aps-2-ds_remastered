@@ -1,12 +1,11 @@
-// main.c (versão otimizada para não enviar dados desnecessários)
-// Substitua o seu main.c por este arquivo.
+// main.c — versão ajustada: IMU NÃO move o cursor; só envia clique direito por gesto.
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdlib.h> 
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
@@ -17,59 +16,78 @@
 #include "queue.h"
 
 #include "Fusion.h"
-#include "mpu6050.h" // seu header
+#include "mpu6050.h" // seu header (assuma compatível)
 
-// =================================================================================
-// === PINOS / CONSTANTES =========================================================
-// =================================================================================
-
+// --------------------------- PINOS / CONSTANTES -------------------------------
 #define IMU_SDA         4
 #define IMU_SCL         5
 #define JOY_X_PIN       26 // ADC0
 #define JOY_Y_PIN       27 // ADC1
 
-#define BTN_ATACK       12 // F
-#define BTN_CURA        13 // Q
-#define BTN_ROLL        14 // R
-#define BTN_ESC         15 // Esc
+#define BTN_ATACK       12 // hardware button -> attack
+#define BTN_CURA        13
+#define BTN_ROLL        14
+#define BTN_ESC         15
 
 #define LED_CONNECTED   16
 
 #define I2C_PORT        i2c0
 #define MPU_ADDRESS     0x68
 
-#define SAMPLE_PERIOD   (0.01f) // 10ms ~ 100 Hz
+#define SAMPLE_PERIOD_MS   10
+#define SAMPLE_PERIOD      (SAMPLE_PERIOD_MS / 1000.0f)
 
-// --- Mouse / IMU ---
-#define MOUSE_DEAD_ZONE_ANGLE   2.0f
-#define MOUSE_SENSITIVITY       0.8f
-#define MOUSE_MAX_SPEED         8
-
-// --- Clique por Gesto ---
+// ----- clique por gesto -----
 #define CLICK_ACCEL_THRESHOLD_Y 20000
 #define CLICK_RESET_THRESHOLD_Y 1000
+#define IMU_CLICK_DEBOUNCE_MS   200  // debounce local
 
-// --- UART IDs ---
-#define UART_ID_IMU_X 0
-#define UART_ID_IMU_Y 1
-#define UART_ID_IMU_CLICK 2
+// ----- joystick thresholds -----
+#define JOY_DEADZONE            1500
+#define JOY_KEY_THRESHOLD       12000
+#define DIAGONAL_E_THRESHOLD    20000
+#define JOY_SEND_THRESHOLD      2000
+#define JOY_MIN_CHANGE          800
 
-#define UART_ID_BTN_ATACK 3
-#define UART_ID_BTN_CURA  4
-#define UART_ID_BTN_ROLL  5
-#define UART_ID_BTN_ESC   6
+// --------------------------- UART IDs (packets) ------------------------------
+#define UART_PKT_SYNC      0xFF
 
-#define UART_ID_JOY_X 7
-#define UART_ID_JOY_Y 8
+// IMU click
+#define ID_IMU_CLICK       2   // value=1 -> click event
 
-// --- Joystick send policy (evita spam) ---
-#define JOY_SEND_THRESHOLD 2000   // só considera movimento significativo se |joy| > threshold
-#define JOY_MIN_CHANGE     800    // só envia se mudou mais que isso desde último envio
+// physical buttons
+#define ID_BTN_ATACK       3
+#define ID_BTN_CURA        4
+#define ID_BTN_ROLL        5
+#define ID_BTN_ESC         6
 
-// =================================================================================
-// === MPU6050 DRIVER (simplificado) ==============================================
-// =================================================================================
+// joystick raw (kept for compatibility)
+#define ID_JOY_X           7
+#define ID_JOY_Y           8
 
+// KEY events generated on MCU (PC only executes)
+#define ID_KEY_W           9
+#define ID_KEY_A           10
+#define ID_KEY_S           11
+#define ID_KEY_D           12
+#define ID_KEY_E           13
+
+// --------------------------- STRUCTS / QUEUES --------------------------------
+typedef struct {
+    bool click;
+    int16_t joy_x;
+    int16_t joy_y;
+} mdata_t;
+
+typedef struct {
+    uint8_t id;
+    bool pressed;
+} bevent_t;
+
+static QueueHandle_t q_mdata;
+static QueueHandle_t q_bevent;
+
+// --------------------------- MPU helper (simplified) --------------------------
 static void mpu6050_reset() {
     uint8_t buf[] = {0x6B, 0x00}; // PWR_MGMT_1 = 0
     i2c_write_blocking(I2C_PORT, MPU_ADDRESS, buf, sizeof(buf), false);
@@ -78,52 +96,40 @@ static void mpu6050_reset() {
 static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) {
     uint8_t buffer[6];
     uint8_t reg;
-
-    // accel
-    reg = 0x3B; // ACCEL_XOUT_H
+    reg = 0x3B;
     i2c_write_blocking(I2C_PORT, MPU_ADDRESS, &reg, 1, true);
     i2c_read_blocking(I2C_PORT, MPU_ADDRESS, buffer, 6, false);
     for (int i = 0; i < 3; i++) accel[i] = (int16_t)((buffer[i*2] << 8) | buffer[i*2 + 1]);
-
-    // gyro
-    reg = 0x43; // GYRO_XOUT_H
+    reg = 0x43;
     i2c_write_blocking(I2C_PORT, MPU_ADDRESS, &reg, 1, true);
     i2c_read_blocking(I2C_PORT, MPU_ADDRESS, buffer, 6, false);
     for (int i = 0; i < 3; i++) gyro[i] = (int16_t)((buffer[i*2] << 8) | buffer[i*2 + 1]);
-
-    // temp
-    reg = 0x41; // TEMP_OUT_H
+    reg = 0x41;
     i2c_write_blocking(I2C_PORT, MPU_ADDRESS, &reg, 1, true);
     i2c_read_blocking(I2C_PORT, MPU_ADDRESS, buffer, 2, false);
     *temp = (int16_t)((buffer[0] << 8) | buffer[1]);
 }
 
-// =================================================================================
-// === TIPOS E FILAS =============================================================
-// =================================================================================
+// --------------------------- UART send helpers --------------------------------
+static inline void uart_send_raw_byte(uint8_t b) {
+    putchar_raw(b);
+}
+static inline void uart_send_packet_int16(uint8_t id, int16_t v) {
+    uart_send_raw_byte(UART_PKT_SYNC);
+    uart_send_raw_byte(id);
+    uart_send_raw_byte((uint8_t)(v & 0xFF));
+    uart_send_raw_byte((uint8_t)((v >> 8) & 0xFF));
+}
+static inline void uart_send_packet_flag(uint8_t id, uint8_t flag) {
+    uart_send_raw_byte(UART_PKT_SYNC);
+    uart_send_raw_byte(id);
+    uart_send_raw_byte(flag);
+    uart_send_raw_byte(0x00);
+}
 
-typedef struct {
-    int16_t x_mov;      // IMU X movement (signed)
-    int16_t y_mov;      // IMU Y movement (signed)
-    bool    click_event; // IMU click gesture
-    int16_t joy_x;      // joystick X mapped signed
-    int16_t joy_y;      // joystick Y mapped signed
-} mouse_data_t;
-
-typedef struct {
-    uint8_t id;
-    bool    pressed;
-} button_event_t;
-
-static QueueHandle_t xQueuePos;
-static QueueHandle_t xQueueBtn;
-
-// =================================================================================
-// === TASK MPU / JOYSTICK (envia apenas quando necessário) =======================
-// =================================================================================
-
-void mpu_task(void *p) {
-    // init I2C
+// --------------------------- TASK: MPU + lógica (faz decisões) ----------------
+void task_mpu(void *p) {
+    // I2C
     i2c_init(I2C_PORT, 400000);
     gpio_set_function(IMU_SDA, GPIO_FUNC_I2C);
     gpio_set_function(IMU_SCL, GPIO_FUNC_I2C);
@@ -131,256 +137,157 @@ void mpu_task(void *p) {
     gpio_pull_up(IMU_SCL);
     mpu6050_reset();
 
-    // ADC joystick init
+    // ADC joystick
     adc_init();
-    adc_gpio_init(JOY_X_PIN); // ADC0
-    adc_gpio_init(JOY_Y_PIN); // ADC1
+    adc_gpio_init(JOY_X_PIN);
+    adc_gpio_init(JOY_Y_PIN);
 
-    int16_t acceleration[3], gyro[3], temp;
-    FusionAhrs ahrs;
-    FusionAhrsInitialise(&ahrs);
+    int16_t accel[3], gyro[3], temp;
     bool can_click = true;
+    uint64_t last_click_ts = 0;
 
-    // variáveis para política de envio do joystick
-    int16_t last_sent_joy_x = 0;
-    int16_t last_sent_joy_y = 0;
+    // joystick state -> we will send key press/release events based on thresholds
+    bool key_w = false, key_a = false, key_s = false, key_d = false, key_e = false;
+    int16_t last_sent_joy_x = 0, last_sent_joy_y = 0;
 
     while (1) {
-        mpu6050_read_raw(acceleration, gyro, &temp);
+        mpu6050_read_raw(accel, gyro, &temp);
 
-        FusionVector gyroscope = { .axis = { .x = gyro[0] / 131.0f, .y = gyro[1] / 131.0f, .z = gyro[2] / 131.0f } };
-        FusionVector accelerometer = { .axis = { .x = acceleration[0] / 16384.0f, .y = acceleration[1] / 16384.0f, .z = acceleration[2] / 16384.0f } };
+        // Apenas lógica de clique por aceleração (não calculamos/mapeamos movimento do cursor)
+        mdata_t out;
+        out.click = false;
+        out.joy_x = 0;
+        out.joy_y = 0;
+        bool any = false;
 
-        FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, SAMPLE_PERIOD);
-        const FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
-
-        // Leitura joystick ADC
-        adc_select_input(0); // ADC0 -> JOY_X_PIN
-        uint16_t raw_x = adc_read(); // 0..4095
-        int16_t joy_x = (int16_t)(((int32_t)raw_x - 2048) * 16);
-
-        adc_select_input(1); // ADC1 -> JOY_Y_PIN
-        uint16_t raw_y = adc_read();
-        int16_t joy_y = (int16_t)(((int32_t)raw_y - 2048) * 16);
-
-        // Prepara estrutura, mas só envia pra fila se houver algo útil
-        mouse_data_t data_to_send;
-        data_to_send.x_mov = 0;
-        data_to_send.y_mov = 0;
-        data_to_send.click_event = false;
-        data_to_send.joy_x = 0;
-        data_to_send.joy_y = 0;
-
-        bool any_to_send = false;
-
-        // IMU X/Y (ângulos) -> só preencher se além da deadzone
-        if (fabsf(euler.angle.roll) > MOUSE_DEAD_ZONE_ANGLE) {
-            int16_t v = (int16_t)(euler.angle.roll * MOUSE_SENSITIVITY * 10.0f);
-            if (v > (MOUSE_MAX_SPEED * 10)) v = MOUSE_MAX_SPEED * 10;
-            if (v < -(MOUSE_MAX_SPEED * 10)) v = -MOUSE_MAX_SPEED * 10;
-            data_to_send.y_mov = v; // roll -> Y
-            any_to_send = true;
-        } else {
-            data_to_send.y_mov = 0;
-        }
-
-        if (fabsf(euler.angle.pitch) > MOUSE_DEAD_ZONE_ANGLE) {
-            int16_t v = (int16_t)(euler.angle.pitch * -MOUSE_SENSITIVITY * 10.0f);
-            if (v > (MOUSE_MAX_SPEED * 10)) v = MOUSE_MAX_SPEED * 10;
-            if (v < -(MOUSE_MAX_SPEED * 10)) v = -MOUSE_MAX_SPEED * 10;
-            data_to_send.x_mov = v; // pitch -> X
-            any_to_send = true;
-        } else {
-            data_to_send.x_mov = 0;
-        }
-
-        // Clique IMU por aceleração
-        if (acceleration[1] > CLICK_ACCEL_THRESHOLD_Y && can_click) {
-            data_to_send.click_event = true;
-            can_click = false;
-            any_to_send = true;
-        } else if (acceleration[1] < CLICK_RESET_THRESHOLD_Y) {
+        // IMU click por aceleração (eixo Y)
+        if (accel[1] > CLICK_ACCEL_THRESHOLD_Y) {
+            uint64_t now = to_us_since_boot(get_absolute_time()) / 1000ULL;
+            if (can_click && (now - last_click_ts) > IMU_CLICK_DEBOUNCE_MS) {
+                out.click = true;
+                any = true;
+                last_click_ts = now;
+                can_click = false;
+            }
+        } else if (accel[1] < CLICK_RESET_THRESHOLD_Y) {
             can_click = true;
         }
 
-        // Joystick: política de envio para X
-        if ( (abs(joy_x) > JOY_SEND_THRESHOLD) ) {
-            // enviável se mudou suficientemente desde último envio
+        // JOYSTICK -> decide quais teclas (w/a/s/d/e) devem estar pressionadas
+        adc_select_input(0);
+        uint16_t raw_x = adc_read();
+        int16_t joy_x = (int16_t)(((int32_t)raw_x - 2048) * 16);
+        adc_select_input(1);
+        uint16_t raw_y = adc_read();
+        int16_t joy_y = (int16_t)(((int32_t)raw_y - 2048) * 16);
+
+        int16_t adj_x = (abs(joy_x) < JOY_DEADZONE) ? 0 : joy_x;
+        int16_t adj_y = (abs(joy_y) < JOY_DEADZONE) ? 0 : joy_y;
+
+        bool should_e = (abs(adj_x) > DIAGONAL_E_THRESHOLD && abs(adj_y) > DIAGONAL_E_THRESHOLD);
+        if (should_e != key_e) {
+            key_e = should_e;
+            uart_send_packet_flag(ID_KEY_E, key_e ? 1 : 0);
+        }
+        bool should_w = (adj_y > JOY_KEY_THRESHOLD);
+        bool should_s = (adj_y < -JOY_KEY_THRESHOLD);
+        if (should_w != key_w) { key_w = should_w; uart_send_packet_flag(ID_KEY_W, key_w ? 1 : 0); }
+        if (should_s != key_s) { key_s = should_s; uart_send_packet_flag(ID_KEY_S, key_s ? 1 : 0); }
+
+        bool should_d = (adj_x > JOY_KEY_THRESHOLD);
+        bool should_a = (adj_x < -JOY_KEY_THRESHOLD);
+        if (should_d != key_d) { key_d = should_d; uart_send_packet_flag(ID_KEY_D, key_d ? 1 : 0); }
+        if (should_a != key_a) { key_a = should_a; uart_send_packet_flag(ID_KEY_A, key_a ? 1 : 0); }
+
+        // enviar joystick raw quando mudar bastante (compatibilidade)
+        if (abs(joy_x) > JOY_SEND_THRESHOLD) {
             if (abs(joy_x - last_sent_joy_x) > JOY_MIN_CHANGE) {
-                data_to_send.joy_x = joy_x;
+                out.joy_x = joy_x;
                 last_sent_joy_x = joy_x;
-                any_to_send = true;
+                any = true;
             }
         } else {
-            // se joystick voltou para centro e antes tinha sido enviado valor significativo,
-            // é útil enviar zero para sinalizar "parado" no PC — enviar zero apenas se último enviado
-            // era fora do threshold (evita spam de zeros)
             if (abs(last_sent_joy_x) > JOY_SEND_THRESHOLD) {
-                data_to_send.joy_x = 0;
+                out.joy_x = 0;
                 last_sent_joy_x = 0;
-                any_to_send = true;
+                any = true;
             }
         }
-
-        // Joystick: política de envio para Y (mesma lógica)
-        if ( (abs(joy_y) > JOY_SEND_THRESHOLD) ) {
+        if (abs(joy_y) > JOY_SEND_THRESHOLD) {
             if (abs(joy_y - last_sent_joy_y) > JOY_MIN_CHANGE) {
-                data_to_send.joy_y = joy_y;
+                out.joy_y = joy_y;
                 last_sent_joy_y = joy_y;
-                any_to_send = true;
+                any = true;
             }
         } else {
             if (abs(last_sent_joy_y) > JOY_SEND_THRESHOLD) {
-                data_to_send.joy_y = 0;
+                out.joy_y = 0;
                 last_sent_joy_y = 0;
-                any_to_send = true;
+                any = true;
             }
         }
 
-        // Se houver algo útil, envia para a fila. Caso contrário ignora (sem enviar zeros inúteis).
-        if (any_to_send) {
-            // tentativa não bloqueante: se fila cheia, descartamos (ou você pode bloquear com timeout)
-            xQueueSend(xQueuePos, &data_to_send, 0);
+        if (any) {
+            xQueueSend(q_mdata, &out, 0);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10)); // 10ms ~ 100Hz
+        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }
 
-// =================================================================================
-// === TASK BOTÕES (sem mudanças significativas) =================================
-// =================================================================================
-
-void button_task(void *p) {
+// --------------------------- TASK: buttons (debounced) -------------------------
+void task_buttons(void *p) {
     const uint btn_pins[] = { BTN_ATACK, BTN_CURA, BTN_ROLL, BTN_ESC };
-    const uint8_t btn_ids[] = { UART_ID_BTN_ATACK, UART_ID_BTN_CURA, UART_ID_BTN_ROLL, UART_ID_BTN_ESC };
-    const int NUM_BTNS = 4;
-
-    for (int i = 0; i < NUM_BTNS; i++) {
-        gpio_init(btn_pins[i]);
-        gpio_set_dir(btn_pins[i], GPIO_IN);
-        gpio_pull_up(btn_pins[i]);
-    }
-
-    bool last_state[NUM_BTNS];
-    bool read_state[NUM_BTNS];
-    uint32_t stable_time[NUM_BTNS];
-    memset(stable_time, 0, sizeof(stable_time));
-
-    for (int i = 0; i < NUM_BTNS; i++) {
-        last_state[i] = gpio_get(btn_pins[i]);
-        read_state[i] = last_state[i];
-    }
-
+    const uint8_t btn_ids[] = { ID_BTN_ATACK, ID_BTN_CURA, ID_BTN_ROLL, ID_BTN_ESC };
+    const int NUM = 4;
+    for (int i = 0; i < NUM; i++) { gpio_init(btn_pins[i]); gpio_set_dir(btn_pins[i], GPIO_IN); gpio_pull_up(btn_pins[i]); }
+    bool last[NUM], read[NUM];
+    uint32_t stable[NUM];
+    memset(stable, 0, sizeof(stable));
+    for (int i = 0; i < NUM; i++) { last[i] = gpio_get(btn_pins[i]); read[i] = last[i]; }
     const uint32_t DEBOUNCE_MS = 20;
     const uint32_t POLL_MS = 10;
-
     while (1) {
-        for (int i = 0; i < NUM_BTNS; i++) {
+        for (int i = 0; i < NUM; i++) {
             bool raw = gpio_get(btn_pins[i]);
-            if (raw == read_state[i]) {
-                stable_time[i] += POLL_MS;
-                if (stable_time[i] >= DEBOUNCE_MS && raw != last_state[i]) {
-                    last_state[i] = raw;
-                    button_event_t ev;
+            if (raw == read[i]) {
+                stable[i] += POLL_MS;
+                if (stable[i] >= DEBOUNCE_MS && raw != last[i]) {
+                    last[i] = raw;
+                    bevent_t ev;
                     ev.id = btn_ids[i];
-                    ev.pressed = (raw == 0); // pull-up logic: 0 pressed
-                    xQueueSend(xQueueBtn, &ev, 0);
+                    ev.pressed = (raw == 0); // pull-up: 0 pressed
+                    xQueueSend(q_bevent, &ev, 0);
                 }
             } else {
-                stable_time[i] = 0;
+                stable[i] = 0;
             }
-            read_state[i] = raw;
+            read[i] = raw;
         }
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
 }
 
-// =================================================================================
-// === TASK UART (envio) - mantida ===============================================
-// =================================================================================
-
-void uart_task(void *p) {
-    mouse_data_t mdata;
-    button_event_t bevent;
-
+// --------------------------- TASK: UART sender --------------------------------
+void task_uart(void *p) {
+    mdata_t md;
+    bevent_t be;
     while (1) {
-        // esvaziar fila de botões
-        while (xQueueReceive(xQueueBtn, &bevent, 0) == pdTRUE) {
-            putchar_raw(0xFF);
-            putchar_raw(bevent.id);
-            putchar_raw(bevent.pressed ? 1 : 0);
-            putchar_raw(0x00);
+        // flush buttons queue (non-blocking)
+        while (xQueueReceive(q_bevent, &be, 0) == pdTRUE) {
+            uart_send_packet_flag(be.id, be.pressed ? 1 : 0);
         }
-
-        // aguarda por pacote do mpu_task
-        if (xQueueReceive(xQueuePos, &mdata, pdMS_TO_TICKS(200))) {
-            // IMU X
-            if (mdata.x_mov != 0) {
-                putchar_raw(0xFF);
-                putchar_raw(UART_ID_IMU_X);
-                putchar_raw(mdata.x_mov & 0xFF);
-                putchar_raw((mdata.x_mov >> 8) & 0xFF);
-            }
-            // IMU Y
-            if (mdata.y_mov != 0) {
-                putchar_raw(0xFF);
-                putchar_raw(UART_ID_IMU_Y);
-                putchar_raw(mdata.y_mov & 0xFF);
-                putchar_raw((mdata.y_mov >> 8) & 0xFF);
-            }
-            // Clique IMU
-            if (mdata.click_event) {
-                putchar_raw(0xFF);
-                putchar_raw(UART_ID_IMU_CLICK);
-                putchar_raw(1);
-                putchar_raw(0x00);
-            }
-            // Joystick X
-            // Se mdata.joy_x==0 significa "parou" e é útil enviar para liberar teclas no PC;
-            // se mdata.joy_x != 0 então envia valor.
-            if (mdata.joy_x != 0) {
-                putchar_raw(0xFF);
-                putchar_raw(UART_ID_JOY_X);
-                putchar_raw(mdata.joy_x & 0xFF);
-                putchar_raw((mdata.joy_x >> 8) & 0xFF);
-            } else {
-                // se zero foi marcado explicitamente (volta ao centro), envie zero para liberar teclas
-                // precisamos distinguir "campo não presente" de "campo zero": no design acima,
-                // quando decidimos enviar zero (retorno ao centro), mdata.joy_x foi ajustado para 0 e any_to_send==true.
-                // portanto se chegarmos aqui com mdata.joy_x==0 e (mdata.joy_y || outras flags) então o zero será enviado abaixo.
-                // Para simplificar, se fila enviou esta struct com joy_x == 0 e nenhuma outra flag para X, envie zero:
-                // (no código atual, só chegamos ao xQueueReceive quando any_to_send==true).
-                // Então enviamos também o zero:
-                if (mdata.joy_x == 0) {
-                    putchar_raw(0xFF);
-                    putchar_raw(UART_ID_JOY_X);
-                    putchar_raw(0 & 0xFF);
-                    putchar_raw(0 >> 8);
-                }
-            }
-            // Joystick Y (mesma lógica)
-            if (mdata.joy_y != 0) {
-                putchar_raw(0xFF);
-                putchar_raw(UART_ID_JOY_Y);
-                putchar_raw(mdata.joy_y & 0xFF);
-                putchar_raw((mdata.joy_y >> 8) & 0xFF);
-            } else {
-                if (mdata.joy_y == 0) {
-                    putchar_raw(0xFF);
-                    putchar_raw(UART_ID_JOY_Y);
-                    putchar_raw(0 & 0xFF);
-                    putchar_raw(0 >> 8);
-                }
-            }
+        // wait for mdata (blocking with timeout)
+        if (xQueueReceive(q_mdata, &md, pdMS_TO_TICKS(200))) {
+            if (md.click) uart_send_packet_flag(ID_IMU_CLICK, 1);
+            // send joystick X/Y packets only for compatibility (no IMU movement)
+            uart_send_packet_int16(ID_JOY_X, md.joy_x);
+            uart_send_packet_int16(ID_JOY_Y, md.joy_y);
         }
-        // sem vTaskDelay aqui: o xQueueReceive bloqueia
     }
 }
 
-// =================================================================================
-// === MAIN =======================================================================
-// =================================================================================
+// --------------------------- main --------------------------------------------
 
 int main() {
     stdio_init_all();
@@ -388,24 +295,18 @@ int main() {
     gpio_set_dir(LED_CONNECTED, GPIO_OUT);
     gpio_put(LED_CONNECTED, 0);
 
-    xQueuePos = xQueueCreate(10, sizeof(mouse_data_t));
-    xQueueBtn = xQueueCreate(10, sizeof(button_event_t));
-
-    if (xQueuePos == NULL || xQueueBtn == NULL) {
-        while (1) {
-            gpio_xor_mask(1u << LED_CONNECTED);
-            sleep_ms(200);
-        }
+    q_mdata = xQueueCreate(10, sizeof(mdata_t));
+    q_bevent = xQueueCreate(10, sizeof(bevent_t));
+    if (!q_mdata || !q_bevent) {
+        while (1) { gpio_xor_mask(1u << LED_CONNECTED); sleep_ms(200); }
     }
 
-    xTaskCreate(mpu_task, "MPU", 4096, NULL, 2, NULL);
-    xTaskCreate(button_task, "BTNs", 1024, NULL, 2, NULL);
-    xTaskCreate(uart_task, "UART", 2048, NULL, 1, NULL);
+    xTaskCreate(task_mpu, "MPU_TASK", 4096, NULL, 2, NULL);
+    xTaskCreate(task_buttons, "BTN_TASK", 1024, NULL, 2, NULL);
+    xTaskCreate(task_uart, "UART_TASK", 2048, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
-    while (true) {
-        tight_loop_contents();
-    }
+    while (1) tight_loop_contents();
     return 0;
 }
