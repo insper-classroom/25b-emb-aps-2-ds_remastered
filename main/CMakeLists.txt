@@ -19,6 +19,8 @@ target_include_directories(pico_emb PRIVATE
 target_link_libraries(pico_emb PRIVATE
     pico_async_context_freertos
     FreeRTOS-Kernel-Heap4
+    hardware_i2c
+    Fusion
     pico_stdlib
     )
 # Set the nunber of cores to 1.
