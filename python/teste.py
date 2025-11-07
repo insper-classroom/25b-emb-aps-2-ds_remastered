@@ -1,7 +1,4 @@
-# teste.py - versão sem calibração do joystick, botões corrigidos
-# IMU -> clique direito, Joystick -> WASD (+ E para diagonal)
-# Não faz calibração que bloqueie; joystick usa deadzone no cliente.
-
+# teste.py - corrigido: botões com state, IMU click debounced, joystick mantém comportamento
 import sys
 import glob
 import serial
@@ -39,9 +36,11 @@ IMU_MOVE_SCALE = 4          # escala para movimento do mouse vindo da IMU
 JOY_KEY_THRESHOLD = 12000   # valor absoluto necessário para considerar direcional
 DIAGONAL_E_THRESHOLD = 20000
 
-# Deadzone/filters on PC (no calibration)
-JOY_DEADZONE = 1500         # if |value| < deadzone => treat as zero
-JOY_CHANGE_MIN = 800        # minimal change to trigger processing (rate-limit)
+JOY_DEADZONE = 1500         # deadzone no cliente
+JOY_CHANGE_MIN = 800        # mínima mudança para processar joystick
+
+# IMU click debounce (ms)
+IMU_CLICK_DEBOUNCE_MS = 200
 
 # ----------------- Estado de teclas (para enviar keyDown/keyUp uma vez) ----------
 key_state = {
@@ -52,12 +51,23 @@ key_state = {
     'e': False
 }
 
+# Estado dos botões físicos (para evitar keyDown repetido)
+button_state = {
+    BTN_ATACK_ID: False,
+    BTN_CURA_ID: False,
+    BTN_ROLL_ID: False,
+    BTN_ESC_ID: False
+}
+
 last_raw_x = 0
 last_raw_y = 0
 last_adj_x = 0
 last_adj_y = 0
 
-# Verbose -> True para debug completo (muitos prints). False para uso normal.
+# tempo do ultimo clique IMU (debounce)
+_last_imu_click_ts = 0.0
+
+# Verbose -> True para debug extenso (muitos prints). False para uso normal.
 VERBOSE = False
 
 # ----------------- HELPERS -----------------
@@ -97,34 +107,55 @@ def move_mouse(axis, value):
         if VERBOSE: print(f"[MOUSE] IMU Y move: raw={value} scaled={dy}")
 
 def handle_click_right(value):
+    global _last_imu_click_ts
     # firmware sends 1 when gesture detected
     if value != 0:
-        print(f"[CLICK] IMU click detected value={value} -> right click")
-        try:
-            pyautogui.click(button='right')
-        except Exception as e:
-            print("Erro em right-click:", e)
+        now = time.time() * 1000.0
+        if now - _last_imu_click_ts > IMU_CLICK_DEBOUNCE_MS:
+            _last_imu_click_ts = now
+            print(f"[CLICK] IMU click detected value={value} -> right click")
+            try:
+                pyautogui.click(button='right')
+            except Exception as e:
+                print("Erro em right-click:", e)
+        else:
+            if VERBOSE: print("[CLICK] debounce ignorado")
 
 def handle_button(id_, value):
-    # value: 1 = pressed, 0 = released (as firmware sends)
+    """
+    value: firmware sends 1 pressed, 0 released
+    Use button_state[...] to keyDown only on transition.
+    """
     key = BUTTON_KEYMAP.get(id_)
-    if not key:
-        if VERBOSE: print(f"[BTN] Botão com ID {id_} não mapeado. value={value}")
+    if key is None:
+        if VERBOSE: print(f"[BTN] Botão ID {id_} não mapeado, value={value}")
         return
-    if value != 0:
-        # press
-        print(f"[BTN] ID {id_} PRESSED -> {key}")
+
+    pressed = (value != 0)
+    prev = button_state.get(id_, False)
+
+    # transitional logic
+    if pressed and not prev:
+        # botão acabou de ser pressionado
+        button_state[id_] = True
+        # para botões talvez queiramos enviar keyDown once (segurar enquanto estiver pressionado)
         try:
             pyautogui.keyDown(key)
         except Exception as e:
-            print("Erro em keyDown:", e)
-    else:
-        # release
-        print(f"[BTN] ID {id_} RELEASED -> {key}")
+            print("Erro keyDown (btn):", e)
+        print(f"[BTN RX] id={id_} PRESSED -> {key}")
+    elif (not pressed) and prev:
+        # botão solto -> keyUp
+        button_state[id_] = False
         try:
             pyautogui.keyUp(key)
         except Exception as e:
-            print("Erro em keyUp:", e)
+            print("Erro keyUp (btn):", e)
+        print(f"[BTN RX] id={id_} RELEASED -> {key}")
+    else:
+        # sem mudança de estado; não reemitir
+        if VERBOSE:
+            print(f"[BTN RX] id={id_} value={value} (sem mudança)")
 
 # ----------------- PARSE -----------------
 def parse_data(data):
@@ -143,33 +174,31 @@ def handle_joystick(raw_x, raw_y):
     """
     global last_adj_x, last_adj_y
 
-    # adjust by deadzone: treat small values as zero
     adj_x = 0 if abs(raw_x) < JOY_DEADZONE else raw_x
     adj_y = 0 if abs(raw_y) < JOY_DEADZONE else raw_y
 
-    # quick exit: if both adj are zero, release keys if any pressed
+    # both zero -> release
     if adj_x == 0 and adj_y == 0:
         if any(key_state[k] for k in ('w','a','s','d','e')):
             release_all_movement_keys()
-        # update lasts
         last_adj_x = 0
         last_adj_y = 0
         return
 
-    # rate-limit: avoid handling very small oscillations
+    # rate-limit
     if abs(adj_x - last_adj_x) < JOY_CHANGE_MIN and abs(adj_y - last_adj_y) < JOY_CHANGE_MIN:
         return
 
     last_adj_x = adj_x
     last_adj_y = adj_y
 
-    # Diagonal strong -> 'e'
+    # diagonal strong -> 'e'
     if abs(adj_x) > DIAGONAL_E_THRESHOLD and abs(adj_y) > DIAGONAL_E_THRESHOLD:
         key_down_if_needed('e')
     else:
         key_up_if_needed('e')
 
-    # Vertical (assumes positive y = up; invert if needed)
+    # vertical
     if adj_y > JOY_KEY_THRESHOLD:
         key_down_if_needed('w')
         key_up_if_needed('s')
@@ -180,7 +209,7 @@ def handle_joystick(raw_x, raw_y):
         key_up_if_needed('w')
         key_up_if_needed('s')
 
-    # Horizontal
+    # horizontal
     if adj_x > JOY_KEY_THRESHOLD:
         key_down_if_needed('d')
         key_up_if_needed('a')
@@ -191,7 +220,7 @@ def handle_joystick(raw_x, raw_y):
         key_up_if_needed('a')
         key_up_if_needed('d')
 
-    # print brief state
+    # brief state print
     print(f"[JOY STATE] adj_x={adj_x} adj_y={adj_y} -> keys: "
           f"{'w' if key_state['w'] else ''}{'a' if key_state['a'] else ''}"
           f"{'s' if key_state['s'] else ''}{'d' if key_state['d'] else ''}"
@@ -199,7 +228,6 @@ def handle_joystick(raw_x, raw_y):
 
 # ----------------- SERIAL / LOOP PRINCIPAL -----------------
 def controle(ser):
-    # no calibration: start reading right away
     print("Loop pronto. Sem calibração de joystick. Pressione botões ou mova joystick.")
     global last_raw_x, last_raw_y
     try:
@@ -209,7 +237,8 @@ def controle(ser):
                 continue
             if sync[0] != 0xFF:
                 # resync quickly
-                if VERBOSE: print(f"[SYNC] ignorando byte {sync[0]:02X}")
+                if VERBOSE:
+                    print(f"[SYNC] ignorando byte {sync[0]:02X}")
                 continue
             data = ser.read(size=3)
             if len(data) < 3:
@@ -218,19 +247,26 @@ def controle(ser):
             if id_ is None:
                 continue
 
+            # ----- debug curto para botões/imu para garantir recebimento -----
+            if id_ == AXIS_IMU_CLICK:
+                # IMU click packet
+                print(f"[RX] id={id_} value={value}")
+                handle_click_right(value)
+                continue
+            if id_ in BUTTON_KEYMAP:
+                # botão packet
+                print(f"[RX] id={id_} value={value}")
+                handle_button(id_, value)
+                continue
+
+            # restante (joystick / imu axes)
             if VERBOSE:
                 print(f"[RX] id={id_} value={value}")
 
             if id_ == AXIS_IMU_X or id_ == AXIS_IMU_Y:
                 move_mouse(id_, value)
-            elif id_ == AXIS_IMU_CLICK:
-                handle_click_right(value)
-            elif id_ in BUTTON_KEYMAP:
-                # value: 1 pressed, 0 released (firmware sends that)
-                handle_button(id_, value)
             elif id_ == JOY_X_ID:
                 last_raw_x = value
-                # combine with last_raw_y to decide
                 handle_joystick(last_raw_x, last_raw_y)
             elif id_ == JOY_Y_ID:
                 last_raw_y = value
@@ -251,7 +287,11 @@ def controle(ser):
         except:
             pass
         print("Conexão serial fechada.")
+        # soltar todas as teclas caso saia
         release_all_movement_keys()
+        # reset button state (just in case)
+        for k in button_state:
+            button_state[k] = False
 
 # ----------------- GUI / PORTAS -----------------
 def serial_ports():
@@ -259,7 +299,6 @@ def serial_ports():
     try:
         return [p.device for p in list_ports.comports()]
     except Exception:
-        # fallback simples
         if sys.platform.startswith('win'):
             return [f'COM{i}' for i in range(1, 21)]
         elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
