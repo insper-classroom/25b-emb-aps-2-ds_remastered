@@ -1,6 +1,3 @@
-# teste.py — leitor simples: recebe pacotes 0xFF id low high
-# Joystick: X -> A/D ; Y -> W/S. IMU -> right click.
-
 import serial
 import time
 import pyautogui
@@ -8,7 +5,6 @@ import pyautogui
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
 
-# IDs (devem bater com main.c)
 ID_IMU_CLICK = 2
 
 ID_BTN_ATACK = 3
@@ -23,7 +19,6 @@ ID_KEY_W = 9
 ID_KEY_A = 10
 ID_KEY_S = 11
 ID_KEY_D = 12
-# ID_KEY_E REMOVED
 
 BUTTON_KEYMAP = {
     ID_BTN_ATACK: 'f',
@@ -34,9 +29,9 @@ BUTTON_KEYMAP = {
 
 KEY_ID_MAP = {
     ID_KEY_W: 'w',
-    ID_KEY_A: 'a',
+    ID_KEY_A: 'd',
     ID_KEY_S: 's',
-    ID_KEY_D: 'd'
+    ID_KEY_D: 'a'
 }
 
 def parse_int16(low, high):
