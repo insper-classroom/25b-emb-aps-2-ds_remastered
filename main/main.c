@@ -116,7 +116,7 @@ static void mpu6050_reset() {
     for (int attempt = 0; attempt < 3; ++attempt) {
         int r = i2c_write_checked(I2C_PORT, MPU_ADDRESS, buf, sizeof(buf), false, 50000); // 50 ms timeout
         if (r == (int)sizeof(buf)) return;
-        sleep_ms(10);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     printf("MPU6050 reset failed after retries\n");
 }
